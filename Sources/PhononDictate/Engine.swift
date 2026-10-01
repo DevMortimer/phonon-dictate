@@ -4,25 +4,31 @@ import Foundation
 final class Engine: ObservableObject {
     enum State: Equatable {
         case checking
-        case installing(String)
+        case installing
         case ready
         case failed(String)
+    }
 
-        var description: String {
-            switch self {
-            case .checking: return "Checking the speech model…"
-            case .installing(let step): return step
-            case .ready: return "Ready"
-            case .failed(let message): return "Setup failed: \(message)"
-            }
+    static let steps = ["Create the Python environment", "Install the speech engine", "Download and prepare Phonon-2"]
+
+    @Published private(set) var state: State = .checking
+    /// Index in `steps` of the step that runs or failed.
+    @Published private(set) var step = 0
+    /// The last line the current step printed.
+    @Published private(set) var detail = ""
+
+    var description: String {
+        switch state {
+        case .checking: return "Checking the speech engine…"
+        case .installing: return "Setting up: \(Engine.steps[step]) (\(step + 1) of \(Engine.steps.count))"
+        case .ready: return "Ready"
+        case .failed: return "Setup failed"
         }
     }
 
-    @Published private(set) var state: State = .checking
-
     private let envDir: URL
     private let marker: URL
-    private let setupLog: URL
+    let setupLog: URL
     let workerLog: URL
     private var python: URL { envDir.appendingPathComponent("bin/python") }
     private var workerScript: URL? { Bundle.main.url(forResource: "worker", withExtension: "py") }
@@ -45,24 +51,34 @@ final class Engine: ObservableObject {
             state = .ready
             return
         }
+        step = 0
+        detail = ""
         guard let uv = Engine.findUV() else {
-            state = .failed("uv is not installed. Run: brew install uv")
+            state = .failed("uv is not installed. Install it with `brew install uv`, then try again.")
             return
         }
+        state = .installing
         FileManager.default.createFile(atPath: setupLog.path, contents: nil)
-        let steps: [(String, URL, [String])] = [
-            ("Creating the Python environment…", uv, ["venv", "--python", "3.12", envDir.path]),
-            ("Installing the speech engine…", uv, ["pip", "install", "--python", python.path, "-r", requirements.path]),
-            ("Downloading Phonon-2…", python, [workerScript.path, "--prepare"]),
+        let commands: [(URL, [String])] = [
+            (uv, ["venv", "--python", "3.12", envDir.path]),
+            (uv, ["pip", "install", "--python", python.path, "-r", requirements.path]),
+            (python, [workerScript.path, "--prepare"]),
         ]
         let envDir = envDir, marker = marker, setupLog = setupLog
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             try? FileManager.default.removeItem(at: envDir)
-            for (label, exe, args) in steps {
-                DispatchQueue.main.async { self?.state = .installing(label) }
-                let status = Engine.run(exe, args, log: setupLog)
+            for (index, (exe, args)) in commands.enumerated() {
+                DispatchQueue.main.async {
+                    self?.step = index
+                    self?.detail = ""
+                }
+                let status = Engine.run(exe, args, log: setupLog) { line in
+                    DispatchQueue.main.async { self?.detail = line }
+                }
                 if status != 0 {
-                    DispatchQueue.main.async { self?.state = .failed("\(label) exited with \(status). See \(setupLog.path)") }
+                    DispatchQueue.main.async {
+                        self?.state = .failed("\(Engine.steps[index]) stopped with exit status \(status). The setup log has the details.")
+                    }
                     return
                 }
             }
@@ -83,7 +99,8 @@ final class Engine: ObservableObject {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }.map { URL(fileURLWithPath: $0) }
     }
 
-    private static func run(_ exe: URL, _ args: [String], log: URL) -> Int32 {
+    /// Runs a setup command. Its output goes to the log, and each last non-empty line to `onLine`.
+    private static func run(_ exe: URL, _ args: [String], log: URL, onLine: @escaping (String) -> Void) -> Int32 {
         let p = Process()
         p.executableURL = exe
         p.arguments = args
@@ -91,10 +108,25 @@ final class Engine: ObservableObject {
         guard let handle = try? FileHandle(forWritingTo: log) else { return -1 }
         handle.seekToEndOfFile()
         handle.write(Data("$ \(exe.path) \(args.joined(separator: " "))\n".utf8))
-        p.standardOutput = handle
-        p.standardError = handle
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        let reader = pipe.fileHandleForReading
+        func consume(_ data: Data) {
+            try? handle.write(contentsOf: data)
+            let lines = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
+            if let line = lines.last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                onLine(line.trimmingCharacters(in: .whitespaces))
+            }
+        }
+        reader.readabilityHandler = { h in
+            let data = h.availableData
+            if !data.isEmpty { consume(data) }
+        }
         do { try p.run() } catch { return -1 }
         p.waitUntilExit()
+        reader.readabilityHandler = nil
+        consume(reader.readDataToEndOfFile())
         try? handle.close()
         return p.terminationStatus
     }

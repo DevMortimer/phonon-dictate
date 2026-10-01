@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var windows: [String: NSWindow] = [:]
     private var subscriptions = Set<AnyCancellable>()
+    private let setupRibbon = RibbonInput()
+    /// True after the user hid the setup window while setup still runs.
+    private var setupHidden = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -41,11 +44,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sink { [weak self] _ in DispatchQueue.main.async { self?.controller.applyRetention() } }
             .store(in: &subscriptions)
 
+        controller.onNotReady = { [weak self] in self?.showSetup() }
+        engine.$state.dropFirst().removeDuplicates().sink { [weak self] state in
+            DispatchQueue.main.async { self?.engineStateChanged(state) }
+        }.store(in: &subscriptions)
+
         controller.applyRetention()
         Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.controller.applyRetention()
         }
         engine.setup()
+    }
+
+    private func engineStateChanged(_ state: Engine.State) {
+        switch state {
+        case .installing where !setupHidden: showSetup()
+        case .failed:
+            setupHidden = false
+            showSetup()
+        default: break
+        }
+    }
+
+    @objc private func showSetup() {
+        let window = windows["setup"] ?? {
+            setupRibbon.synthetic = engine.state != .ready
+            let view = SetupView(engine: engine, shortcut: settings.shortcut.display, ribbon: setupRibbon) { [weak self] in
+                self?.setupHidden = true
+                self?.windows["setup"]?.close()
+            }
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "Phonon Dictate Setup"
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.backgroundColor = NSColor(red: 0.055, green: 0.055, blue: 0.07, alpha: 1)
+            w.isMovableByWindowBackground = true
+            w.isReleasedWhenClosed = false
+            w.contentViewController = NSHostingController(rootView: view)
+            w.center()
+            windows["setup"] = w
+            return w
+        }()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     private func registerHotKey(_ shortcut: Shortcut, enabled: Bool) {
@@ -75,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let hotKeyError {
             status = hotKeyError
         } else if engine.state != .ready {
-            status = engine.state.description
+            status = engine.description
         } else {
             switch controller.phase {
             case .idle: status = "Press \(settings.shortcut.display) to dictate"
@@ -90,6 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle.target = self
         toggle.isEnabled = controller.phase != .transcribing && engine.state == .ready
         menu.addItem(toggle)
+        if engine.state != .ready {
+            addItem(menu, "Show Setup…", #selector(showSetup))
+        }
         menu.addItem(.separator())
 
         let recent = NSMenuItem(title: "Recent", action: nil, keyEquivalent: "")

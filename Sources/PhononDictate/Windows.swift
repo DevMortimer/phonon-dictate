@@ -40,7 +40,7 @@ struct SettingsView: View {
             }
             Section("Model") {
                 LabeledContent("Model", value: "Phonon-2 (FermionResearch)")
-                LabeledContent("Status", value: engine.state.description)
+                LabeledContent("Status", value: engine.description)
             }
         }
         .formStyle(.grouped)

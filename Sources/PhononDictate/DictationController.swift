@@ -17,12 +17,14 @@ final class DictationController: ObservableObject {
     private var worker: Worker?
     private var file: URL?
     private var startedAt = Date()
+    /// Called when the user starts a dictation before setup finished.
+    var onNotReady: (() -> Void)?
 
     init(store: Store, engine: Engine, settings: Settings) {
         self.store = store
         self.engine = engine
         self.settings = settings
-        recorder.onLevel = { [weak self] level in self?.overlay.model.push(level) }
+        recorder.onMeter = { [weak self] meter in self?.overlay.model.ribbon.meter = meter }
     }
 
     func toggle() {
@@ -36,7 +38,8 @@ final class DictationController: ObservableObject {
     func start() {
         guard phase == .idle else { return }
         guard engine.state == .ready else {
-            overlay.flash(engine.state.description, symbol: "hourglass")
+            overlay.flash("Still setting up", symbol: "hourglass", tone: .neutral, seconds: 1.8)
+            onNotReady?()
             return
         }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -98,16 +101,16 @@ final class DictationController: ObservableObject {
             case .success(let raw):
                 let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 if text.isEmpty {
-                    self.overlay.flash("No speech detected", symbol: "waveform.slash", seconds: 1.5)
+                    self.overlay.flash("No speech detected", symbol: "waveform.slash", tone: .neutral, seconds: 1.5)
                 } else {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
                     self.store.add(HistoryEntry(date: self.startedAt, text: text, audioFile: file.lastPathComponent, duration: duration))
-                    self.overlay.flash("Copied to clipboard", symbol: "checkmark.circle.fill", seconds: 1.2)
+                    self.overlay.flash("Copied", symbol: "checkmark.circle.fill", tone: .success, seconds: 1.1)
                 }
             case .failure(let error):
                 NSLog("PhononDictate: transcription failed: \(error.localizedDescription)")
-                self.overlay.flash("Transcription failed. See worker.log", seconds: 3)
+                self.overlay.flash("Transcription failed. Details in worker.log", seconds: 3)
             }
             self.applyRetention()
         }

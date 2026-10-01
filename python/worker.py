@@ -8,7 +8,17 @@ stdout, and exits. The exit frees the model memory.
 second of silence, and exits. The app runs it once during setup.
 """
 import json
+import re
 import sys
+
+# Phonon-2 writes "like 2.8" as "like2 .8": the number joins the word before it
+# and the decimal part splits off. These two patterns repair that.
+_JOINED = re.compile(r"([A-Za-z])(\d+) \.(\d)")
+_SPLIT = re.compile(r"(\d) \.(\d)")
+
+
+def fix_numbers(text):
+    return _SPLIT.sub(r"\1.\2", _JOINED.sub(r"\1 \2.\3", text))
 
 
 def load_model():
@@ -40,7 +50,7 @@ def main():
         if not path:
             return 0  # the app cancelled the recording
         text, decode_s, duration_s = speech.transcribe_detailed(path).triple()
-        emit({"text": text, "duration_seconds": duration_s, "decode_seconds": decode_s})
+        emit({"text": fix_numbers(text), "duration_seconds": duration_s, "decode_seconds": decode_s})
         return 0
     except SystemExit as e:  # fermion exits with a message for user errors
         emit({"error": str(e.code)})

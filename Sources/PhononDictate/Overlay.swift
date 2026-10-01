@@ -2,33 +2,25 @@ import AppKit
 import SwiftUI
 
 final class OverlayModel: ObservableObject {
+    enum Tone { case neutral, success, error }
+
     enum Mode: Equatable {
         case recording(since: Date)
         case transcribing
-        case message(String, symbol: String)
+        case message(String, symbol: String, tone: Tone)
     }
-
-    static let barCount = 36
 
     @Published var mode: Mode = .transcribing
-    @Published var levels = [CGFloat](repeating: 0, count: OverlayModel.barCount)
-
-    func push(_ level: Float) {
-        levels.removeFirst()
-        levels.append(CGFloat(level))
-    }
-
-    func resetLevels() {
-        levels = [CGFloat](repeating: 0, count: OverlayModel.barCount)
-    }
+    @Published var visible = false
+    let ribbon = RibbonInput()
 }
 
-/// A floating capsule at the bottom of the screen. It takes no focus and no clicks.
+/// A floating pill at the bottom of the screen. It takes no focus and no clicks.
 final class OverlayController {
     let model = OverlayModel()
     private let panel: NSPanel
     private var hideWork: DispatchWorkItem?
-    private static let size = NSSize(width: 320, height: 90)
+    private static let size = NSSize(width: 400, height: 120)
 
     init() {
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: OverlayController.size),
@@ -47,16 +39,21 @@ final class OverlayController {
     }
 
     func showRecording() {
-        model.resetLevels()
+        model.ribbon.meter = Meter(level: 0, low: 0, mid: 0, high: 0)
+        model.ribbon.flatten = 0
+        model.ribbon.sweep = 0
         show(.recording(since: Date()))
     }
 
     func showTranscribing() {
+        model.ribbon.meter = Meter(level: 0, low: 0, mid: 0, high: 0)
+        model.ribbon.flatten = 1
+        model.ribbon.sweep = 1
         show(.transcribing)
     }
 
-    func flash(_ text: String, symbol: String = "exclamationmark.triangle.fill", seconds: Double = 2.5) {
-        show(.message(text, symbol: symbol))
+    func flash(_ text: String, symbol: String = "exclamationmark.triangle.fill", tone: OverlayModel.Tone = .error, seconds: Double = 2.5) {
+        show(.message(text, symbol: symbol, tone: tone))
         let work = DispatchWorkItem { [weak self] in self?.hide() }
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
@@ -65,84 +62,116 @@ final class OverlayController {
     func hide() {
         hideWork?.cancel()
         hideWork = nil
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.15
-            panel.animator().alphaValue = 0
-        }, completionHandler: { [panel] in
-            if panel.alphaValue == 0 { panel.orderOut(nil) }
-        })
+        model.visible = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.model.visible else { return }
+            self.panel.orderOut(nil)
+        }
     }
 
     private func show(_ mode: OverlayModel.Mode) {
         hideWork?.cancel()
         hideWork = nil
-        model.mode = mode
-        if !panel.isVisible || panel.alphaValue < 1 {
-            let mouse = NSEvent.mouseLocation
-            let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
-            if let frame = screen?.visibleFrame {
-                panel.setFrameOrigin(NSPoint(x: frame.midX - OverlayController.size.width / 2, y: frame.minY + 48))
-            }
-            panel.alphaValue = 0
-            panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
-                panel.animator().alphaValue = 1
-            }
+        if model.visible {
+            model.mode = mode
+            return
         }
+        model.mode = mode
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        if let frame = screen?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: frame.midX - OverlayController.size.width / 2, y: frame.minY + 24))
+        }
+        panel.orderFrontRegardless()
+        DispatchQueue.main.async { self.model.visible = true }
     }
 }
 
 struct OverlayView: View {
     @ObservedObject var model: OverlayModel
 
-    var body: some View {
-        HStack(spacing: 12) {
-            switch model.mode {
-            case .recording(let since):
-                Circle().fill(.red).frame(width: 8, height: 8)
-                Waveform(levels: model.levels)
-                TimelineView(.periodic(from: since, by: 1)) { context in
-                    Text(Self.elapsed(context.date.timeIntervalSince(since)))
-                        .font(.system(size: 12, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            case .transcribing:
-                ProgressView().controlSize(.small)
-                Text("Transcribing…").font(.system(size: 13, weight: .medium))
-            case .message(let text, let symbol):
-                Image(systemName: symbol)
-                Text(text).font(.system(size: 13, weight: .medium)).lineLimit(1)
-            }
+    private static let ink = Color(red: 0.055, green: 0.055, blue: 0.07)
+    private static let recordRed = Color(red: 1.0, green: 0.3, blue: 0.33)
+    private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    private var showsRibbon: Bool {
+        switch model.mode {
+        case .recording, .transcribing: return true
+        case .message: return false
         }
-        .padding(.horizontal, 16)
-        .frame(height: 44)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
-        .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        .environment(\.colorScheme, .dark)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    var body: some View {
+        content
+            .padding(.horizontal, 18)
+            .frame(height: 52)
+            .background {
+                Capsule().fill(Self.ink)
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.09), lineWidth: 1))
+            }
+            .compositingGroup()
+            .shadow(color: .black.opacity(0.35), radius: 16, y: 8)
+            .scaleEffect(model.visible || reduceMotion ? 1 : 0.6)
+            .blur(radius: model.visible || reduceMotion ? 0 : 8)
+            .opacity(model.visible ? 1 : 0)
+            .animation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.42, dampingFraction: 0.72), value: model.visible)
+            .animation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.38, dampingFraction: 0.8), value: model.mode)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.colorScheme, .dark)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if showsRibbon {
+            HStack(spacing: 12) {
+                if case .recording = model.mode {
+                    Circle().fill(Self.recordRed).frame(width: 7, height: 7)
+                        .transition(.scale.combined(with: .opacity))
+                }
+                RibbonView(input: model.ribbon, active: model.visible)
+                    .frame(width: 200, height: 44)
+                    .accessibilityLabel("Voice level")
+                switch model.mode {
+                case .recording(let since):
+                    TimelineView(.periodic(from: since, by: 1)) { context in
+                        Text(Self.elapsed(context.date.timeIntervalSince(since)))
+                            .font(.system(size: 13, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.62))
+                    }
+                    .transition(.opacity)
+                default:
+                    Text("Transcribing")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .transition(.opacity)
+                }
+            }
+        } else if case .message(let text, let symbol, let tone) = model.mode {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Self.color(tone))
+                    .symbolEffect(.bounce, value: text)
+                Text(text)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+            }
+            .fixedSize()
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        }
+    }
+
+    private static func color(_ tone: OverlayModel.Tone) -> Color {
+        switch tone {
+        case .neutral: return .white.opacity(0.85)
+        case .success: return Color(red: 0.36, green: 0.86, blue: 0.56)
+        case .error: return Color(red: 1.0, green: 0.72, blue: 0.32)
+        }
     }
 
     static func elapsed(_ t: TimeInterval) -> String {
         let s = max(0, Int(t))
         return String(format: "%d:%02d", s / 60, s % 60)
-    }
-}
-
-/// Bars for the most recent input levels, newest on the right.
-struct Waveform: View {
-    var levels: [CGFloat]
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 2) {
-            ForEach(levels.indices, id: \.self) { i in
-                Capsule()
-                    .fill(.white.opacity(0.9))
-                    .frame(width: 3, height: 3 + levels[i] * 25)
-            }
-        }
-        .frame(height: 28)
-        .animation(.linear(duration: 0.06), value: levels)
     }
 }
